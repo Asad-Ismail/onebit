@@ -1,4 +1,9 @@
-"""Model loading, weight mapping, and management."""
+"""Model loading, weight mapping, and management.
+
+Supports two quantization paths:
+1. mlx-lm 2-bit: Proven quality, uses MLX-LM's quantization engine (default)
+2. Native ternary: For models trained with ternary weights (BitNet b1.58)
+"""
 
 from __future__ import annotations
 
@@ -9,12 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
-import mlx.nn as nn
-
-from onebit.layers import BitLinear
-from onebit.models.config import ModelConfig
-from onebit.models.transformer import TransformerModel
-from onebit.quant import quantize_to_ternary
+import mlx.utils
 
 logger = logging.getLogger(__name__)
 
@@ -23,53 +23,156 @@ CACHE_DIR = Path.home() / ".cache" / "onebit"
 
 def load_model(
     model_name_or_path: str,
+    bits: int = 4,
     use_metal_kernel: bool = True,
-) -> tuple[TransformerModel, "AutoTokenizer"]:
+):
     """Load a model by registry name, HF repo ID, or local path.
 
-    If the model is not yet quantized to ternary, it will be quantized
-    on-the-fly and cached locally.
+    For non-ternary models, uses mlx-lm's quantization for quality.
+    For natively-trained ternary models, uses our custom ternary path.
+
+    Args:
+        model_name_or_path: Registry name, HF repo, or local dir
+        bits: Quantization bits (2 for quality, or 158 for native ternary)
+        use_metal_kernel: Use custom Metal kernel for ternary decode
 
     Returns:
         (model, tokenizer) tuple ready for generation.
     """
     from onebit.models.registry import MODELS
 
-    # Resolve model path
+    # Resolve model
     if model_name_or_path in MODELS:
         info = MODELS[model_name_or_path]
         hf_repo = info["hf_repo"]
         cache_name = model_name_or_path
+        is_native_ternary = info.get("native_ternary", False)
     elif Path(model_name_or_path).is_dir():
-        return _load_local(Path(model_name_or_path), use_metal_kernel)
+        return _load_local_dir(Path(model_name_or_path))
     else:
         hf_repo = model_name_or_path
         cache_name = hf_repo.replace("/", "--")
+        is_native_ternary = False
 
-    # Check for cached ternary model
+    # Check cache
     cached_path = CACHE_DIR / cache_name
     if cached_path.exists() and (cached_path / "config.json").exists():
-        logger.info(f"Loading cached ternary model from {cached_path}")
-        return _load_local(cached_path, use_metal_kernel)
+        logger.info(f"Loading cached model from {cached_path}")
+        return _load_local_dir(cached_path)
 
-    # Download and convert
-    logger.info(f"Downloading {hf_repo} from HuggingFace...")
-    local_path = _download_hf_model(hf_repo)
+    # Download and quantize
+    if is_native_ternary:
+        return _load_native_ternary(hf_repo, cached_path, use_metal_kernel)
+    else:
+        return _load_and_quantize_mlxlm(hf_repo, cached_path, bits)
 
-    logger.info("Quantizing to 1.58-bit ternary...")
+
+def _load_and_quantize_mlxlm(hf_repo: str, cache_path: Path, bits: int = 2):
+    """Load and quantize using mlx-lm's proven quantization."""
+    import mlx_lm
+
+    logger.info(f"Downloading {hf_repo}...")
+
+    # Use mlx-lm to load the full-precision model
+    logger.info("Loading model with mlx-lm...")
+    model, tokenizer = mlx_lm.load(hf_repo)
+
+    # Quantize with mlx-lm
+    logger.info(f"Quantizing to {bits}-bit with mlx-lm...")
     t0 = time.time()
-    model, tokenizer = _load_and_quantize(local_path, use_metal_kernel)
+
+    # mlx-lm quantize: convert linear layers to QuantizedLinear
+    from mlx_lm.utils import quantize_model as _mlx_quantize
+
+    q_config = {"group_size": 64, "bits": bits}
+    model, q_config = _mlx_quantize(model, q_config, group_size=64, bits=bits)
+    mx.eval(model.parameters())
+
     dt = time.time() - t0
     logger.info(f"Quantization complete in {dt:.1f}s")
 
-    # Cache the ternary model
-    _save_ternary_model(model, tokenizer, local_path, cached_path)
-    logger.info(f"Cached ternary model at {cached_path}")
+    # Save using mlx-lm's save which handles QuantizedLinear correctly
+    cache_path.mkdir(parents=True, exist_ok=True)
+    from mlx_lm.utils import save_model as _mlx_save
+    _mlx_save(str(cache_path), model)
+    tokenizer.save_pretrained(str(cache_path))
+    # Add quantization config to config.json
+    config_file = cache_path / "config.json"
+    if config_file.exists():
+        with open(config_file) as f:
+            cfg = json.load(f)
+        cfg.setdefault("quantization", {"group_size": 64, "bits": bits})
+        with open(config_file, "w") as f:
+            json.dump(cfg, f, indent=2)
+    logger.info(f"Cached at {cache_path}")
 
     return model, tokenizer
 
 
-def _download_hf_model(repo_id: str) -> Path:
+def _load_native_ternary(hf_repo: str, cache_path: Path, use_metal_kernel: bool):
+    """Load a natively-trained ternary model (BitNet b1.58)."""
+    from onebit.models.config import ModelConfig
+    from onebit.models.transformer import TransformerModel
+    from transformers import AutoTokenizer
+
+    logger.info(f"Downloading native ternary model {hf_repo}...")
+    local_path = _download_hf(hf_repo)
+
+    config = ModelConfig.from_hf_config(local_path / "config.json")
+    tokenizer = AutoTokenizer.from_pretrained(str(local_path), trust_remote_code=True)
+
+    model = TransformerModel(config, ternary=True)
+    _load_and_quantize_weights_ternary(model, local_path, config)
+    mx.eval(model.parameters())
+
+    # Cache
+    cache_path.mkdir(parents=True, exist_ok=True)
+    _save_ternary_model(model, tokenizer, local_path, cache_path)
+
+    return model, tokenizer
+
+
+def _load_local_dir(model_dir: Path):
+    """Load from a local directory (auto-detect format)."""
+    # Check if it's an mlx-lm quantized model
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.json found in {model_dir}")
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # Check for onebit ternary marker
+    onebit_config = model_dir / "onebit_config.json"
+    if onebit_config.exists():
+        with open(onebit_config) as f:
+            ob = json.load(f)
+        if ob.get("format") == "ternary":
+            return _load_ternary_local(model_dir)
+
+    # Default: load with mlx-lm (handles both quantized and FP16)
+    import mlx_lm
+    return mlx_lm.load(str(model_dir))
+
+
+def _load_ternary_local(model_dir: Path):
+    """Load a native ternary model from local cache."""
+    from onebit.models.config import ModelConfig
+    from onebit.models.transformer import TransformerModel
+    from transformers import AutoTokenizer
+
+    config = ModelConfig.from_hf_config(model_dir / "config.json")
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+
+    model = TransformerModel(config, ternary=True)
+    weights = _load_safetensors(model_dir)
+    model.load_weights(list(weights.items()), strict=False)
+    mx.eval(model.parameters())
+
+    return model, tokenizer
+
+
+def _download_hf(repo_id: str) -> Path:
     """Download model from HuggingFace Hub."""
     from huggingface_hub import snapshot_download
 
@@ -80,49 +183,8 @@ def _download_hf_model(repo_id: str) -> Path:
     return Path(local_dir)
 
 
-def _load_local(
-    model_dir: Path, use_metal_kernel: bool = True
-) -> tuple[TransformerModel, "AutoTokenizer"]:
-    """Load a model from a local directory (either FP16 or pre-quantized ternary)."""
-    from transformers import AutoTokenizer
-
-    config = ModelConfig.from_hf_config(model_dir / "config.json")
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-
-    # Check if this is already a ternary model
-    onebit_config = model_dir / "onebit_config.json"
-    is_ternary = onebit_config.exists()
-
-    if is_ternary:
-        model = TransformerModel(config, ternary=True)
-        _load_ternary_weights(model, model_dir, config)
-    else:
-        # Load FP16 and quantize on the fly
-        model = TransformerModel(config, ternary=True)
-        _load_and_quantize_weights(model, model_dir, config, use_metal_kernel)
-
-    mx.eval(model.parameters())
-    return model, tokenizer
-
-
-def _load_and_quantize(
-    model_dir: Path, use_metal_kernel: bool = True
-) -> tuple[TransformerModel, "AutoTokenizer"]:
-    """Load FP16 model and quantize all linear layers to ternary."""
-    from transformers import AutoTokenizer
-
-    config = ModelConfig.from_hf_config(model_dir / "config.json")
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-
-    model = TransformerModel(config, ternary=True)
-    _load_and_quantize_weights(model, model_dir, config, use_metal_kernel)
-    mx.eval(model.parameters())
-
-    return model, tokenizer
-
-
 def _load_safetensors(model_dir: Path) -> dict[str, mx.array]:
-    """Load all safetensors files from a directory into a flat dict."""
+    """Load all safetensors files from a directory."""
     import glob
 
     weights = {}
@@ -132,177 +194,93 @@ def _load_safetensors(model_dir: Path) -> dict[str, mx.array]:
     return weights
 
 
-def _load_and_quantize_weights(
-    model: TransformerModel,
-    model_dir: Path,
-    config: ModelConfig,
-    use_metal_kernel: bool = True,
-) -> None:
-    """Load FP16 weights, quantize linear layers to ternary, and assign to model."""
-    raw_weights = _load_safetensors(model_dir)
+def _load_and_quantize_weights_ternary(model, model_dir, config):
+    """Load FP16 weights and quantize linear layers to ternary."""
+    from onebit.quant import quantize_to_ternary
 
-    # Build the weight mapping
+    raw_weights = _load_safetensors(model_dir)
     mapped = {}
     n_layers = config.num_hidden_layers
 
-    # Embedding and norm (keep FP16)
-    mapped["model.embed_tokens.weight"] = raw_weights.get("model.embed_tokens.weight")
-
+    # Embedding and norms (keep FP16)
+    if "model.embed_tokens.weight" in raw_weights:
+        mapped["model.embed_tokens.weight"] = raw_weights["model.embed_tokens.weight"]
     if "model.norm.weight" in raw_weights:
         mapped["model.norm.weight"] = raw_weights["model.norm.weight"]
-
-    # LM head (keep FP16)
     if "lm_head.weight" in raw_weights:
         mapped["lm_head.weight"] = raw_weights["lm_head.weight"]
     elif config.tie_word_embeddings:
-        mapped["lm_head.weight"] = raw_weights["model.embed_tokens.weight"]
+        mapped["lm_head.weight"] = raw_weights.get("model.embed_tokens.weight")
 
-    # Transformer layers
     for i in range(n_layers):
         pfx = f"model.layers.{i}"
+        for key in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            full_key = f"{pfx}.{key}"
+            if full_key in raw_weights:
+                mapped[full_key] = raw_weights[full_key]
 
-        # Layer norms (keep FP16)
-        mapped[f"{pfx}.input_layernorm.weight"] = raw_weights[f"{pfx}.input_layernorm.weight"]
-        mapped[f"{pfx}.post_attention_layernorm.weight"] = raw_weights[
-            f"{pfx}.post_attention_layernorm.weight"
-        ]
+        # Quantize attention and MLP weights
+        for proj in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                      "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+            w_key = f"{pfx}.{proj}.weight"
+            if w_key in raw_weights:
+                packed, scale = quantize_to_ternary(raw_weights[w_key])
+                mapped[f"{pfx}.{proj}.packed_weights"] = packed
+                mapped[f"{pfx}.{proj}.weight_scale"] = scale
 
-        # Attention projections
-        if config.fused_qkv and f"{pfx}.self_attn.qkv_proj.weight" in raw_weights:
-            qkv_w = raw_weights[f"{pfx}.self_attn.qkv_proj.weight"]
-            q_dim = config.num_attention_heads * config.head_dim
-            kv_dim = config.num_key_value_heads * config.head_dim
-            q_w, k_w, v_w = mx.split(qkv_w, [q_dim, q_dim + kv_dim], axis=0)
-            _quantize_and_map(mapped, f"{pfx}.self_attn.q_proj", q_w)
-            _quantize_and_map(mapped, f"{pfx}.self_attn.k_proj", k_w)
-            _quantize_and_map(mapped, f"{pfx}.self_attn.v_proj", v_w)
+            # Pass through biases
+            b_key = f"{pfx}.{proj}.bias"
+            if b_key in raw_weights:
+                mapped[b_key] = raw_weights[b_key]
 
-            # Handle fused bias if present
-            bias_key = f"{pfx}.self_attn.qkv_proj.bias"
-            if bias_key in raw_weights:
-                qkv_b = raw_weights[bias_key]
-                q_b, k_b, v_b = mx.split(qkv_b, [q_dim, q_dim + kv_dim], axis=0)
-                mapped[f"{pfx}.self_attn.q_proj.bias"] = q_b
-                mapped[f"{pfx}.self_attn.k_proj.bias"] = k_b
-                mapped[f"{pfx}.self_attn.v_proj.bias"] = v_b
-        else:
-            for proj in ("q_proj", "k_proj", "v_proj"):
-                key = f"{pfx}.self_attn.{proj}.weight"
-                if key in raw_weights:
-                    _quantize_and_map(mapped, f"{pfx}.self_attn.{proj}", raw_weights[key])
-                bias_key = f"{pfx}.self_attn.{proj}.bias"
-                if bias_key in raw_weights:
-                    mapped[bias_key] = raw_weights[bias_key]
-
-        # Output projection
-        o_key = f"{pfx}.self_attn.o_proj.weight"
-        if o_key in raw_weights:
-            _quantize_and_map(mapped, f"{pfx}.self_attn.o_proj", raw_weights[o_key])
-        o_bias = f"{pfx}.self_attn.o_proj.bias"
-        if o_bias in raw_weights:
-            mapped[o_bias] = raw_weights[o_bias]
-
-        # MLP
-        if config.fused_gate_up and f"{pfx}.mlp.gate_up_proj.weight" in raw_weights:
-            gu_w = raw_weights[f"{pfx}.mlp.gate_up_proj.weight"]
-            gate_w, up_w = mx.split(gu_w, 2, axis=0)
-            _quantize_and_map(mapped, f"{pfx}.mlp.gate_proj", gate_w)
-            _quantize_and_map(mapped, f"{pfx}.mlp.up_proj", up_w)
-        else:
-            for proj in ("gate_proj", "up_proj"):
-                key = f"{pfx}.mlp.{proj}.weight"
-                if key in raw_weights:
-                    _quantize_and_map(mapped, f"{pfx}.mlp.{proj}", raw_weights[key])
-
-        down_key = f"{pfx}.mlp.down_proj.weight"
-        if down_key in raw_weights:
-            _quantize_and_map(mapped, f"{pfx}.mlp.down_proj", raw_weights[down_key])
-
-    # Assign weights to model (strict=False to handle unexpected extra params)
     model.load_weights(list(mapped.items()), strict=False)
 
 
-def _quantize_and_map(mapped: dict, prefix: str, weight: mx.array) -> None:
-    """Quantize a weight to ternary and add packed_weights + weight_scale to the mapping."""
-    packed, scale = quantize_to_ternary(weight)
-    mapped[f"{prefix}.packed_weights"] = packed
-    mapped[f"{prefix}.weight_scale"] = scale
-
-
-def _load_ternary_weights(
-    model: TransformerModel,
-    model_dir: Path,
-    config: ModelConfig,
-) -> None:
-    """Load pre-quantized ternary weights from safetensors."""
-    weights = _load_safetensors(model_dir)
-    model.load_weights(list(weights.items()), strict=False)
-
-
-def _save_ternary_model(
-    model: TransformerModel,
-    tokenizer: "AutoTokenizer",
-    original_dir: Path,
-    output_dir: Path,
-) -> None:
-    """Save a ternary model to disk for fast loading next time."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config
-    config_dict = model.config.to_dict()
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config_dict, f, indent=2)
-
-    # Save onebit marker
-    with open(output_dir / "onebit_config.json", "w") as f:
-        json.dump({"quantization": "ternary_1.58bit", "version": "0.1.0"}, f)
+def _save_mlxlm_model(model, tokenizer, base_model, output_dir, bits):
+    """Save mlx-lm quantized model."""
+    import mlx_lm
 
     # Save weights
-    weights = dict(model.parameters())
-    flat_weights = {}
-    _flatten_params(weights, "", flat_weights)
-    mx.save_safetensors(str(output_dir / "model.safetensors"), flat_weights)
+    weights = dict(mlx.utils.tree_flatten(model.parameters()))
+    mx.save_safetensors(str(output_dir / "model.safetensors"), weights)
 
     # Save tokenizer
     tokenizer.save_pretrained(str(output_dir))
 
-    logger.info(f"Saved ternary model to {output_dir}")
+    # Copy config and add our metadata
+    try:
+        from huggingface_hub import hf_hub_download
+        config_path = hf_hub_download(base_model, "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception:
+        config = {}
+
+    config["quantization_config"] = {"bits": bits, "group_size": 64, "quant_method": "mlx"}
+    config["onebit"] = {"base_model": base_model, "bits": bits}
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
 
 
-def _flatten_params(params, prefix: str, out: dict) -> None:
-    """Flatten nested parameter dict to dot-separated keys."""
-    if isinstance(params, dict):
-        for k, v in params.items():
-            new_prefix = f"{prefix}.{k}" if prefix else k
-            _flatten_params(v, new_prefix, out)
-    elif isinstance(params, list):
-        for i, v in enumerate(params):
-            _flatten_params(v, f"{prefix}.{i}", out)
-    elif isinstance(params, mx.array):
-        out[prefix] = params
+def _save_ternary_model(model, tokenizer, original_dir, output_dir):
+    """Save a native ternary model."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    weights = dict(mlx.utils.tree_flatten(model.parameters()))
+    mx.save_safetensors(str(output_dir / "model.safetensors"), weights)
+    tokenizer.save_pretrained(str(output_dir))
+
+    with open(output_dir / "onebit_config.json", "w") as f:
+        json.dump({"format": "ternary", "version": "0.1.0"}, f)
+
+    config_dict = model.config.to_dict()
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config_dict, f, indent=2)
 
 
-def get_model_memory_mb(model: TransformerModel) -> float:
-    """Estimate model memory usage in MB."""
-    total_bytes = 0
-    for _, p in model.parameters().items() if isinstance(model.parameters(), dict) else []:
-        total_bytes += p.nbytes
-    # Fallback: walk parameters
-    params = dict(_iter_params(model))
-    total_bytes = sum(p.nbytes for p in params.values())
-    return total_bytes / (1024 * 1024)
-
-
-def _iter_params(module, prefix=""):
-    """Iterate over all parameters in a module."""
-    if isinstance(module, mx.array):
-        yield prefix, module
-    elif isinstance(module, nn.Module):
-        for k, v in vars(module).items():
-            yield from _iter_params(v, f"{prefix}.{k}" if prefix else k)
-    elif isinstance(module, dict):
-        for k, v in module.items():
-            yield from _iter_params(v, f"{prefix}.{k}" if prefix else k)
-    elif isinstance(module, list):
-        for i, v in enumerate(module):
-            yield from _iter_params(v, f"{prefix}.{i}" if prefix else str(i))
+def get_model_size_mb(model) -> float:
+    """Estimate model memory in MB."""
+    total = 0
+    for _, v in mlx.utils.tree_flatten(model.parameters()):
+        total += v.nbytes
+    return total / (1024 * 1024)

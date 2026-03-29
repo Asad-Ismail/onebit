@@ -33,9 +33,10 @@ def test_quantize_to_ternary():
 
     assert packed.shape == (64, 128 // 4)
     assert packed.dtype == mx.uint8
-    assert scale.shape == (1,)
+    # Per-row scaling: scale shape is (out_features,)
+    assert scale.shape == (64,)
     assert scale.dtype == mx.float16
-    assert scale.item() > 0
+    assert mx.all(scale > 0).item()
 
 
 def test_unpack_values():

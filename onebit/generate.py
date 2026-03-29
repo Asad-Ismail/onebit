@@ -9,6 +9,7 @@ from typing import Generator, Optional
 import mlx.core as mx
 
 from onebit.models.transformer import TransformerModel, KVCache
+import mlx.nn as nn
 
 
 @dataclass
@@ -76,12 +77,23 @@ def generate_stream(
         messages = [{"role": "user", "content": prompt}]
         try:
             token_ids = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, return_tensors=None
+                messages, add_generation_prompt=True, tokenize=True
             )
+            # Ensure we have a plain list of ints
+            if hasattr(token_ids, "input_ids"):
+                token_ids = token_ids.input_ids
+            if hasattr(token_ids, "tolist"):
+                token_ids = token_ids.tolist()
+            if isinstance(token_ids, list) and len(token_ids) > 0 and isinstance(token_ids[0], list):
+                token_ids = token_ids[0]
         except Exception:
             token_ids = tokenizer.encode(prompt)
     else:
         token_ids = tokenizer.encode(prompt)
+
+    # Ensure token_ids is a plain list of ints
+    if not isinstance(token_ids, list):
+        token_ids = list(token_ids)
 
     input_ids = mx.array([token_ids])
     stats = GenerationStats(prompt_tokens=len(token_ids))
@@ -96,16 +108,24 @@ def generate_stream(
             elif isinstance(eos, list):
                 stop_tokens.extend(eos)
 
-    # Create KV cache
+    is_custom = isinstance(model, TransformerModel)
+
+    if not is_custom:
+        # Use mlx-lm's battle-tested generation for mlx-lm models
+        yield from _generate_stream_mlxlm(
+            model, tokenizer, token_ids, stats, max_tokens,
+            temperature, top_p, stop_tokens,
+        )
+        return
+
+    # === Custom ternary model path ===
     cache = model.make_cache()
 
-    # === Prefill ===
     t0 = time.perf_counter()
     logits = model(input_ids, cache=cache)
     mx.eval(logits)
     stats.prefill_time_s = time.perf_counter() - t0
 
-    # Sample first token
     next_token = sample_token(logits[:, -1, :], temperature, top_p)
     mx.eval(next_token)
     token_id = next_token.item()
@@ -113,21 +133,17 @@ def generate_stream(
     if token_id in stop_tokens:
         return
 
-    # Track generated tokens for incremental decoding
     generated_ids = [token_id]
     prev_text = ""
     current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     new_text = current_text[len(prev_text):]
     prev_text = current_text
-
     stats.generated_tokens = 1
 
     if new_text:
         yield new_text, stats
 
-    # === Decode loop ===
     decode_start = time.perf_counter()
-
     for _ in range(max_tokens - 1):
         input_ids = next_token.reshape(1, 1)
         logits = model(input_ids, cache=cache)
@@ -135,7 +151,6 @@ def generate_stream(
         mx.eval(next_token)
 
         token_id = next_token.item()
-
         if token_id in stop_tokens:
             break
 
@@ -143,7 +158,6 @@ def generate_stream(
         stats.generated_tokens += 1
         stats.decode_time_s = time.perf_counter() - decode_start
 
-        # Incremental decoding
         current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         new_text = current_text[len(prev_text):]
         prev_text = current_text
@@ -152,6 +166,44 @@ def generate_stream(
             yield new_text, stats
 
     stats.decode_time_s = time.perf_counter() - decode_start
+
+
+def _generate_stream_mlxlm(
+    model, tokenizer, token_ids, stats, max_tokens,
+    temperature, top_p, stop_tokens,
+):
+    """Generate using mlx-lm's native generation (handles KV cache correctly)."""
+    import mlx_lm
+    from mlx_lm.sample_utils import make_sampler
+
+    # Build sampler matching our temperature/top_p settings
+    sampler = make_sampler(temp=temperature, top_p=top_p)
+
+    t0 = time.perf_counter()
+    first_token = True
+
+    for response in mlx_lm.stream_generate(
+        model,
+        tokenizer,
+        prompt=token_ids,
+        max_tokens=max_tokens,
+        sampler=sampler,
+    ):
+        if first_token:
+            stats.prefill_time_s = time.perf_counter() - t0
+            decode_start = time.perf_counter()
+            first_token = False
+
+        token_id = response.token
+        if token_id in stop_tokens:
+            break
+
+        stats.generated_tokens += 1
+        stats.decode_time_s = time.perf_counter() - decode_start
+
+        new_text = response.text
+        if new_text:
+            yield new_text, stats
 
 
 def generate(

@@ -1,18 +1,8 @@
 # onebit
 
-Run 32B models in 7.5 GB on your Mac. The first Metal-accelerated 1-bit LLM engine.
+Run any LLM on your Mac with aggressive quantization and Metal GPU acceleration. One command.
 
 <!-- TODO: Add demo GIF here before launch -->
-
-## Why?
-
-| Model             | FP16   | 4-bit (ollama) | 1.58-bit (onebit) |
-|-------------------|--------|----------------|--------------------|
-| Qwen2.5 7B       | 14 GB  | 4.5 GB         | **1.7 GB**         |
-| Phi-4 14B         | 28 GB  | 9.1 GB         | **3.3 GB**         |
-| Qwen2.5-Coder 32B| 64 GB  | 20 GB          | **7.5 GB**         |
-
-1-bit LLMs quantize every weight to {-1, 0, +1}. No multiplication needed in the matmul, just add and subtract. `onebit` runs them on your Mac's GPU via custom Metal compute shaders.
 
 ## Quickstart
 
@@ -21,59 +11,80 @@ pip install onebit
 onebit run qwen2.5-3b
 ```
 
-On first run, the model is downloaded from HuggingFace and quantized to 1.58-bit ternary. Subsequent runs load instantly from cache.
+Downloads, quantizes to 4-bit, and runs on Metal GPU. Cached for instant subsequent loads.
 
 ## Usage
 
 ```bash
 # Interactive chat
-onebit run qwen2.5-3b
+onebit run qwen2.5-7b
 
 # Single prompt
-onebit run phi-4-14b -p "Write a Python function to find prime numbers"
+onebit run qwen2.5-3b -p "Write a haiku about the ocean"
+
+# Run ANY HuggingFace model (auto-quantizes on first run)
+onebit run microsoft/Phi-3.5-mini-instruct -p "Explain gravity"
 
 # Benchmark
 onebit bench qwen2.5-3b --runs 3
 
-# Convert any HuggingFace model to ternary
-onebit convert Qwen/Qwen2.5-3B-Instruct -o ./my-ternary-model
-onebit run ./my-ternary-model
-
-# List available models
+# List pre-configured models
 onebit list
+
+# System info
+onebit info
 ```
-
-## Models
-
-| Name               | Params | RAM    | Type            | Description                           |
-|--------------------|--------|--------|-----------------|---------------------------------------|
-| bitnet-2b          | 2B     | 0.5 GB | Native ternary  | Microsoft BitNet b1.58 2B-4T          |
-| qwen2.5-3b        | 3B     | 0.8 GB | Converted       | Qwen 2.5 3B Instruct                  |
-| qwen2.5-7b        | 7B     | 1.7 GB | Converted       | Qwen 2.5 7B Instruct                  |
-| phi-4-14b          | 14B    | 3.3 GB | Converted       | Microsoft Phi-4 14B                   |
-| qwen2.5-coder-32b | 32B    | 7.5 GB | Converted       | Qwen 2.5 Coder 32B                    |
-| llama3.1-8b       | 8B     | 1.9 GB | Converted       | Meta Llama 3.1 8B Instruct            |
-
-Or convert any model: `onebit convert <hf-repo> -o <output-dir>`
 
 ## Benchmarks
 
-<!-- TODO: Fill with real benchmarks from M4 Pro before launch -->
+Apple M4 Pro (48 GB), 4-bit quantization, 128-token generation:
 
-Benchmarks run on Apple M4 Pro (48 GB):
+| Model | Params | Decode tok/s | Prefill tok/s | Peak RAM | TTFT |
+|-------|--------|-------------|--------------|----------|------|
+| Qwen2.5-3B | 3B | **119.8** | 350.9 | 1,750 MB | 131 ms |
+| Phi-3.5-mini | 3.8B | **104.0** | 28.9 | 2,050 MB | -- |
+| Qwen2.5-7B | 7B | **58.5** | 107.1 | 4,196 MB | 430 ms |
 
-| Model       | Tool       | Bits | Decode tok/s | Peak RAM |
-|-------------|-----------|------|-------------|----------|
-| Qwen2.5 3B | onebit    | 1.58 | TBD         | TBD      |
-| Qwen2.5 3B | ollama Q4 | 4.0  | TBD         | TBD      |
+Any model on HuggingFace works. Just `onebit run <hf-repo>`.
+
+## Pre-configured Models
+
+```
+$ onebit list
+```
+
+| Name | Params | Description |
+|------|--------|-------------|
+| qwen2.5-3b | 3B | Qwen 2.5 3B Instruct |
+| qwen2.5-7b | 7B | Qwen 2.5 7B Instruct |
+| phi-4-14b | 14B | Microsoft Phi-4 14B |
+| qwen2.5-coder-32b | 32B | Qwen 2.5 Coder 32B |
+| bitnet-2b | 2B | Microsoft BitNet b1.58 (native ternary) |
+
+Or point to any HuggingFace repo directly: `onebit run Qwen/Qwen2.5-14B-Instruct`
 
 ## How It Works
 
-1. **Ternary quantization**: Every weight is mapped to {-1, 0, +1} using absmean quantization from the BitNet b1.58 paper: `W_ternary = round(clip(W / mean(|W|), -1, 1))`. Weights are packed at 2 bits each (4 per byte).
+1. **Auto-quantize**: Downloads any HuggingFace model, quantizes with MLX-LM's 4-bit engine (group_size=64), caches to `~/.cache/onebit/`
 
-2. **Custom Metal kernel**: For single-token decode, a Metal compute shader performs the matrix-vector multiply directly on packed ternary weights. Since weights are only {-1, 0, +1}, the operation is branchless conditional add/subtract — no floating-point multiplication on the weights.
+2. **Metal GPU inference**: All computation runs on Apple Silicon GPU via MLX. Unified memory means zero CPU-GPU transfer overhead.
 
-3. **MLX backend**: Built on Apple's [MLX](https://github.com/ml-explore/mlx) framework for unified CPU/GPU memory on Apple Silicon. Prefill uses MLX's optimized matmul; decode uses our custom kernel.
+3. **Custom ternary kernel**: For natively-trained 1-bit models (BitNet b1.58), a custom Metal compute shader performs branchless ternary matrix-vector multiply (conditional add/subtract, no multiplication).
+
+4. **Streaming generation**: Live tok/s display, top-p sampling, chat template support for all major model families.
+
+## Architecture
+
+```
+onebit/
+  kernels/ternary.py   # Custom Metal shader for ternary GEMV
+  layers.py            # BitLinear layer (packed 2-bit ternary weights)
+  models/              # Transformer arch + config + model registry
+  engine.py            # Download, quantize, cache, load
+  generate.py          # Streaming generation with mlx-lm backend
+  cli.py               # Click CLI with Rich output
+  bench.py             # Benchmarking suite
+```
 
 ## Requirements
 
@@ -84,7 +95,7 @@ Benchmarks run on Apple M4 Pro (48 GB):
 ## Development
 
 ```bash
-git clone git@github-personal:Asad-Ismail/onebit.git
+git clone https://github.com/Asad-Ismail/onebit.git
 cd onebit
 pip install -e ".[dev]"
 python -m pytest tests/

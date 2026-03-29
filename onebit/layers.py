@@ -83,6 +83,7 @@ class BitLinear(nn.Module):
         """Multi-token prefill using standard MLX matmul."""
         weights = unpack_ternary(self.packed_weights, self.in_features)
         out = x @ weights.T
+        # weight_scale is [out_features] (per-row) or [1] (per-tensor)
         return out * self.weight_scale
 
     @classmethod

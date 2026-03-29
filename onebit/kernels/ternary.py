@@ -38,7 +38,9 @@ TERNARY_MATVEC_SOURCE = """
              + s3 * float(inp[base_k + 3]);
     }
 
-    output[row] = half(sum * float(scale[0]));
+    // Support both per-row scale[M] and per-tensor scale[1]
+    uint scale_idx = (scale_shape[0] > 1) ? row : 0;
+    output[row] = half(sum * float(scale[scale_idx]));
 """
 
 _kernel_cache = {}

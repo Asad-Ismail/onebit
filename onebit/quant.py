@@ -3,26 +3,36 @@
 import mlx.core as mx
 
 
-def quantize_to_ternary(weight: mx.array) -> tuple[mx.array, mx.array]:
+def quantize_to_ternary(weight: mx.array, per_row: bool = True) -> tuple[mx.array, mx.array]:
     """Quantize FP16/BF16 weight matrix to ternary {-1, 0, +1}.
 
-    Uses absmean quantization from the BitNet b1.58 paper:
-        scale = mean(|W|)
-        W_ternary = round(clip(W / scale, -1, 1))
+    Uses absmean quantization from the BitNet b1.58 paper.
+    Per-row scaling preserves much more information than per-tensor.
 
     Args:
         weight: [out_features, in_features] float16/bfloat16/float32
+        per_row: If True, use per-row scale (recommended). Otherwise per-tensor.
 
     Returns:
         packed: [out_features, in_features // 4] uint8 — 4 ternary values per byte
-        scale:  [1] float16 — per-tensor scale factor
+        scale:  [out_features] or [1] float16 — scale factor(s)
     """
-    scale = mx.mean(mx.abs(weight))
-    scale = mx.maximum(scale, mx.array(1e-5))
-    normalized = weight / scale
-    ternary = mx.clip(mx.round(normalized), -1, 1).astype(mx.int8)
-    packed = pack_ternary(ternary)
-    return packed, scale.astype(mx.float16).reshape(1)
+    if per_row and weight.ndim == 2:
+        # Per-row scaling: each output neuron gets its own scale
+        scale = mx.mean(mx.abs(weight), axis=1, keepdims=True)  # [M, 1]
+        scale = mx.maximum(scale, mx.array(1e-5))
+        normalized = weight / scale
+        ternary = mx.clip(mx.round(normalized), -1, 1).astype(mx.int8)
+        packed = pack_ternary(ternary)
+        return packed, scale.squeeze(1).astype(mx.float16)  # [M]
+    else:
+        # Per-tensor scaling (original BitNet paper, for natively-trained models)
+        scale = mx.mean(mx.abs(weight))
+        scale = mx.maximum(scale, mx.array(1e-5))
+        normalized = weight / scale
+        ternary = mx.clip(mx.round(normalized), -1, 1).astype(mx.int8)
+        packed = pack_ternary(ternary)
+        return packed, scale.astype(mx.float16).reshape(1)
 
 
 def pack_ternary(weights: mx.array) -> mx.array:
