@@ -2,6 +2,7 @@
 
 Run LLMs locally on Apple Silicon in one command.
 
+[![CI](https://github.com/Asad-Ismail/onebit/actions/workflows/ci.yml/badge.svg)](https://github.com/Asad-Ismail/onebit/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
