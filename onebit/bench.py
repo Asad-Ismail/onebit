@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from onebit.generate import generate_stream
-from onebit.models.transformer import TransformerModel
 
 
 @dataclass
@@ -78,7 +77,7 @@ def reset_peak_memory() -> None:
 
 
 def benchmark_model(
-    model: TransformerModel,
+    model,
     tokenizer,
     model_name: str = "unknown",
     prompt: str | None = None,

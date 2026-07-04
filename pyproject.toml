@@ -10,16 +10,10 @@ dependencies = [
     "mlx-lm>=0.20.0",
     "click>=8.0",
     "rich>=13.0",
-    "huggingface-hub>=0.20",
-    "safetensors>=0.4",
-    "transformers>=4.40",
-    "pyyaml>=6.0",
-    "jinja2>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.3"]
-bench = ["lm-eval>=0.4"]
 
 [project.scripts]
 onebit = "onebit.cli:cli"
