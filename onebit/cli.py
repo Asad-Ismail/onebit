@@ -48,7 +48,7 @@ def run(model_name, prompt, max_tokens, temperature, top_p, verbose):
 
         onebit run phi-4-14b -p "Write a haiku about AI"
 
-        onebit run ./my-converted-model
+        onebit run ./my-model
     """
     _setup_logging(verbose)
 
@@ -180,38 +180,6 @@ def bench(model_name, max_tokens, runs, prompt, verbose):
     console.print(table)
 
 
-@cli.command("convert")
-@click.argument("hf_model_id")
-@click.option("--output", "-o", required=True, help="Output directory for converted model")
-@click.option("--keep-lm-head", is_flag=True, help="Also quantize the lm_head (not recommended)")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
-def convert_cmd(hf_model_id, output, keep_lm_head, verbose):
-    """Convert a HuggingFace model to 1.58-bit ternary format.
-
-    Example:
-
-        onebit convert Qwen/Qwen2.5-3B-Instruct -o ./qwen-3b-ternary
-    """
-    _setup_logging(verbose)
-
-    from onebit.convert import convert_model
-
-    console.print(f"[bold]Converting[/bold] {hf_model_id} to 1.58-bit ternary...")
-    console.print()
-
-    try:
-        output_path = convert_model(
-            hf_model_id,
-            output,
-            skip_lm_head=not keep_lm_head,
-        )
-        console.print(f"\n[bold green]Done![/bold green] Saved to: {output_path}")
-        console.print(f"[dim]Run with: onebit run {output_path}[/dim]")
-    except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        sys.exit(1)
-
-
 @cli.command("list")
 def list_cmd():
     """List available pre-configured models."""
@@ -234,7 +202,7 @@ def list_cmd():
     console.print(table)
     console.print()
     console.print("[dim]Run any model with: onebit run <name>[/dim]")
-    console.print("[dim]Or convert your own: onebit convert <hf-repo> -o ./output[/dim]")
+    console.print("[dim]Or any HF repo: onebit run <owner/model>[/dim]")
 
 
 @cli.command()

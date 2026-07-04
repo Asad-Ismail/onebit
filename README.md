@@ -38,7 +38,6 @@ onebit run Qwen/Qwen2.5-14B-Instruct        # any HF repo, quantized on first ru
 onebit run ./my-model                       # a local directory
 
 onebit bench qwen2.5-3b --runs 3            # tok/s, TTFT, peak RAM
-onebit convert Qwen/Qwen2.5-3B-Instruct -o ./out   # export a ternary model
 onebit list                                 # pre-configured models
 onebit info                                 # system / MLX / Metal info
 ```
@@ -62,28 +61,18 @@ onebit bench qwen2.5-3b --runs 3
 
 ## Quantization
 
-**4-bit (default).** Standard HuggingFace checkpoints are quantized with
-MLX-LM's engine (`group_size=64`). This is the proven path and runs for every
-model in the registry and any HF repo you pass.
-
-**Ternary / 1.58-bit (experimental).** `onebit convert <repo> -o <dir>`
-post-training-quantizes an FP16 checkpoint to ternary weights in onebit's own
-format, which run on a custom MLX transformer with a Metal GEMV kernel that
-replaces weight multiplies with conditional add/subtract. This path is not yet
-quality-validated against the 4-bit path — treat it as experimental. Native
-HuggingFace BitNet checkpoints (e.g. `microsoft/bitnet-b1.58-2B-4T`) use a
-different on-disk packing and are not supported yet.
+Standard HuggingFace checkpoints are downloaded as FP16 and quantized to 4-bit
+with MLX-LM's engine (`group_size=64`) on first run, then cached. Pass any HF
+repo or a local model directory (already-quantized or FP16) — both load through
+mlx-lm.
 
 ## Project layout
 
 | Path | Purpose |
 |------|---------|
 | `engine.py` | Resolve, download, quantize, cache, and load models |
-| `generate.py` | Streaming generation (mlx-lm backend + custom ternary path) |
-| `quant.py` | Ternary pack/unpack and absmean quantization |
-| `layers.py` | `BitLinear` — 2-bit packed ternary linear layer |
-| `kernels/ternary.py` | Metal shader for ternary matrix-vector multiply |
-| `models/` | Generic transformer, config mapping, model registry |
+| `generate.py` | Streaming generation over the mlx-lm backend |
+| `models/registry.py` | Pre-configured model registry |
 | `bench.py` | Benchmark harness |
 | `cli.py` | Command-line interface |
 
