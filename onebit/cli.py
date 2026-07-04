@@ -20,12 +20,15 @@ def _setup_logging(verbose: bool = False):
         format="%(message)s",
         handlers=[logging.StreamHandler()],
     )
+    # Even in verbose mode, keep onebit's logs — not the HTTP/TLS chatter from deps.
+    for noisy in ("httpcore", "httpx", "urllib3", "huggingface_hub", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @click.group()
 @click.version_option(package_name="onebit")
 def cli():
-    """onebit — Run 1-bit LLMs on your Mac with Metal GPU acceleration."""
+    """onebit — Run LLMs locally on Apple Silicon via MLX."""
     pass
 
 
@@ -35,10 +38,9 @@ def cli():
 @click.option("--max-tokens", "-n", default=512, help="Maximum tokens to generate")
 @click.option("--temperature", "-t", default=0.7, help="Sampling temperature (0 = greedy)")
 @click.option("--top-p", default=0.9, help="Top-p (nucleus) sampling threshold")
-@click.option("--no-metal-kernel", is_flag=True, help="Disable custom Metal kernel")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
-def run(model_name, prompt, max_tokens, temperature, top_p, no_metal_kernel, verbose):
-    """Run a ternary model. Provide a registry name, HF repo, or local path.
+def run(model_name, prompt, max_tokens, temperature, top_p, verbose):
+    """Run a model. Provide a registry name, HF repo, or local path.
 
     Examples:
 
@@ -51,10 +53,7 @@ def run(model_name, prompt, max_tokens, temperature, top_p, no_metal_kernel, ver
     _setup_logging(verbose)
 
     from onebit.engine import load_model
-    from onebit.generate import generate_stream
     from onebit.bench import get_memory_mb
-
-    use_kernel = not no_metal_kernel
 
     # Load model
     with Progress(
@@ -63,9 +62,9 @@ def run(model_name, prompt, max_tokens, temperature, top_p, no_metal_kernel, ver
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task(f"Loading {model_name}...", total=None)
+        progress.add_task(f"Loading {model_name}...", total=None)
         try:
-            model, tokenizer = load_model(model_name, use_metal_kernel=use_kernel)
+            model, tokenizer = load_model(model_name)
         except Exception as e:
             console.print(f"[bold red]Error loading model:[/bold red] {e}")
             sys.exit(1)
@@ -134,7 +133,7 @@ def bench(model_name, max_tokens, runs, prompt, verbose):
     _setup_logging(verbose)
 
     from onebit.engine import load_model
-    from onebit.bench import benchmark_model, get_memory_mb, get_peak_memory_mb
+    from onebit.bench import benchmark_model, get_memory_mb
 
     # Load model
     with Progress(
@@ -222,16 +221,13 @@ def list_cmd():
     table.add_column("Name", style="bold cyan")
     table.add_column("Params", justify="right")
     table.add_column("RAM", justify="right")
-    table.add_column("Type")
     table.add_column("Description")
 
     for m in list_models():
-        model_type = "Native ternary" if m.get("native_ternary") else "Converted"
         table.add_row(
             m["name"],
             m["params"],
             f"{m['ram_gb']:.1f} GB",
-            model_type,
             m["description"],
         )
 
