@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 import mlx.core as mx
 
-from onebit.generate import generate_stream, GenerationStats
+from onebit.generate import generate_stream
 from onebit.models.transformer import TransformerModel
 
 

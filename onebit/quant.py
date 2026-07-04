@@ -88,23 +88,3 @@ def unpack_ternary(packed: mx.array, K: int) -> mx.array:
     # Formula: value = (w & 1) - (w >> 1)
     decoded = (unpacked & 1).astype(mx.float16) - (unpacked >> 1).astype(mx.float16)
     return decoded
-
-
-def compute_ternary_stats(weight: mx.array) -> dict:
-    """Compute statistics about a ternary quantization."""
-    scale = mx.mean(mx.abs(weight))
-    normalized = weight / mx.maximum(scale, mx.array(1e-5))
-    ternary = mx.clip(mx.round(normalized), -1, 1).astype(mx.int8)
-
-    total = ternary.size
-    n_zero = mx.sum(ternary == 0).item()
-    n_pos = mx.sum(ternary == 1).item()
-    n_neg = mx.sum(ternary == -1).item()
-
-    return {
-        "scale": scale.item(),
-        "sparsity": n_zero / total,
-        "pos_frac": n_pos / total,
-        "neg_frac": n_neg / total,
-        "zero_frac": n_zero / total,
-    }

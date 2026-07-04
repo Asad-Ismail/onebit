@@ -9,9 +9,9 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from onebit.engine import _download_hf_model, _load_safetensors, _flatten_params
+from onebit.engine import _download_hf, _load_safetensors
 from onebit.models.config import ModelConfig
-from onebit.quant import quantize_to_ternary, compute_ternary_stats
+from onebit.quant import quantize_to_ternary
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def convert_model(
 
     # Download model
     logger.info(f"Downloading {hf_model_id}...")
-    model_dir = _download_hf_model(hf_model_id)
+    model_dir = _download_hf(hf_model_id)
 
     # Load config
     config = ModelConfig.from_hf_config(model_dir / "config.json")

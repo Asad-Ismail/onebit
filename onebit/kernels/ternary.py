@@ -90,20 +90,3 @@ def ternary_matvec(
         stream=mx.gpu,
     )
     return outputs[0]
-
-
-def ternary_matvec_fallback(
-    packed_weights: mx.array,
-    input_vec: mx.array,
-    scale: mx.array,
-    K: int,
-) -> mx.array:
-    """Fallback ternary GEMV using standard MLX ops (no custom kernel).
-
-    Used when the Metal kernel is not available or for debugging.
-    """
-    from onebit.quant import unpack_ternary
-
-    weights = unpack_ternary(packed_weights, K)  # [M, K] float16
-    out = weights @ input_vec  # [M]
-    return out * scale

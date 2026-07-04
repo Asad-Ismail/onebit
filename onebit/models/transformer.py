@@ -1,6 +1,5 @@
 """Generic transformer model supporting Llama, Qwen, Phi, and BitNet architectures."""
 
-import math
 from typing import Optional
 
 import mlx.core as mx

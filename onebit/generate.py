@@ -8,8 +8,7 @@ from typing import Generator, Optional
 
 import mlx.core as mx
 
-from onebit.models.transformer import TransformerModel, KVCache
-import mlx.nn as nn
+from onebit.models.transformer import TransformerModel
 
 
 @dataclass

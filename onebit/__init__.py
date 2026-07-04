@@ -1,3 +1,3 @@
-"""onebit — Run 1-bit LLMs on your Mac with Metal GPU acceleration."""
+"""onebit — Run LLMs locally on Apple Silicon via MLX."""
 
 __version__ = "0.1.0"
